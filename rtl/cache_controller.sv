@@ -38,11 +38,13 @@ module cache_controller (
     logic [31:0] saved_read_data;
     logic [31:0] fetched_word;
 
-    logic cache_hit, cache_hit_way;
+    logic cache_hit;
+    logic cache_hit_way;
     logic [31:0] cache_read_data;
     logic valid_way0, valid_way1;
 
-    logic cache_install, cache_install_way;
+    logic cache_install;
+    logic cache_install_way;
     logic [15:0] cache_install_address;
     logic [31:0] cache_install_data;
 
@@ -53,8 +55,10 @@ module cache_controller (
 
     logic [11:0] request_tag;
     logic [1:0] request_index, request_offset;
+
     logic victim_way;
-    logic lru_access_valid, lru_accessed_way;
+    logic lru_access_valid;
+    logic lru_accessed_way;
 
     logic [31:0] merged_word;
 
@@ -95,20 +99,24 @@ module cache_controller (
         .victim_way(victim_way)
     );
 
+    // Merge only the bytes enabled by the CPU request.
     always_comb begin
         merged_word = fetched_word;
 
         for (int b = 0; b < 4; b++) begin
-            if (saved_byte_enable[b])
+            if (saved_byte_enable[b]) begin
                 merged_word[8*b +: 8] =
                     saved_write_data[8*b +: 8];
+            end
         end
     end
 
+    // Combinational control signals.
     always_comb begin
         cpu_ready = 1'b0;
         cpu_read_data = saved_read_data;
 
+        // Memory requests are disabled by default.
         mem_req = 1'b0;
         mem_write = 1'b0;
         mem_address = saved_address;
@@ -129,41 +137,65 @@ module cache_controller (
         lru_accessed_way = 1'b0;
 
         case (state)
+
+            IDLE: begin
+                // Wait for a CPU request.
+            end
+
             LOOKUP: begin
                 if (cache_hit) begin
                     lru_access_valid = 1'b1;
                     lru_accessed_way = cache_hit_way;
 
                     if (saved_write) begin
+                        // Update the cache once, on this clock edge.
                         cache_write_hit = 1'b1;
-                        mem_req = 1'b1;
-                        mem_write = 1'b1;
                     end
                 end else begin
+                    // Start a memory read on a cache miss.
                     mem_req = 1'b1;
                     mem_write = 1'b0;
                 end
             end
 
             READ_WAIT: begin
+                // Keep the read request asserted until acknowledgement.
                 mem_req = 1'b1;
                 mem_write = 1'b0;
             end
 
             REFILL: begin
+                // Install the fetched word, or its byte-merged version
+                // for a write-allocate store miss.
                 cache_install = 1'b1;
-                cache_install_data = saved_write ? merged_word : fetched_word;
 
-                if (saved_write) begin
-                    mem_req = 1'b1;
-                    mem_write = 1'b1;
-                    mem_write_data = merged_word;
-                end
+                if (saved_write)
+                    cache_install_data = merged_word;
+                else
+                    cache_install_data = fetched_word;
+
+                // Mark the installed way as recently used.
+                lru_access_valid = 1'b1;
+                lru_accessed_way = victim_way;
             end
 
             WRITE_WAIT: begin
+                // This is the ONLY state that issues a memory write.
+                // All request fields remain stable while waiting.
                 mem_req = 1'b1;
                 mem_write = 1'b1;
+
+                if (saved_write) begin
+                    // Write hit: write the CPU's selected bytes.
+                    // Write miss: write the already-merged full word.
+                    if (cache_hit) begin
+                        mem_write_data = saved_write_data;
+                        mem_byte_enable = saved_byte_enable;
+                    end else begin
+                        mem_write_data = merged_word;
+                        mem_byte_enable = 4'b1111;
+                    end
+                end
             end
 
             RESPOND: begin
@@ -175,32 +207,37 @@ module cache_controller (
         endcase
     end
 
+    // Sequential state and request registers.
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE;
+
             saved_address <= 16'b0;
             saved_write_data <= 32'b0;
             saved_byte_enable <= 4'b0;
             saved_write <= 1'b0;
+
             saved_read_data <= 32'b0;
             fetched_word <= 32'b0;
         end else begin
             case (state)
+
                 IDLE: begin
                     if (cpu_req) begin
                         saved_address <= cpu_address;
                         saved_write_data <= cpu_write_data;
                         saved_byte_enable <= cpu_byte_enable;
                         saved_write <= cpu_write;
+
                         state <= LOOKUP;
                     end
                 end
 
                 LOOKUP: begin
                     if (cache_hit) begin
-                        if (saved_write)
+                        if (saved_write) begin
                             state <= WRITE_WAIT;
-                        else begin
+                        end else begin
                             saved_read_data <= cache_read_data;
                             state <= RESPOND;
                         end
@@ -210,25 +247,26 @@ module cache_controller (
                 end
 
                 READ_WAIT: begin
-                    if (mem_req && mem_ready) begin
+                    if (mem_ready) begin
                         fetched_word <= mem_read_data;
                         state <= REFILL;
                     end
                 end
 
                 REFILL: begin
-                    if (saved_write)
+                    if (saved_write) begin
                         state <= WRITE_WAIT;
-                    else begin
+                    end else begin
                         saved_read_data <= fetched_word;
                         state <= RESPOND;
                     end
                 end
 
                 WRITE_WAIT: begin
-                    if (mem_req && mem_ready) begin
+                    if (mem_ready) begin
                         if (saved_write)
                             saved_read_data <= saved_write_data;
+
                         state <= RESPOND;
                     end
                 end
@@ -237,10 +275,11 @@ module cache_controller (
                     state <= IDLE;
                 end
 
-                default: state <= IDLE;
+                default: begin
+                    state <= IDLE;
+                end
             endcase
         end
     end
 
 endmodule
-
